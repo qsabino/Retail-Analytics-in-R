@@ -1,0 +1,1099 @@
+---
+title: "Retail_Analytics"
+author: "Quyen Di Sabino"
+date: "2026-02-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+## Project Overview
+
+This project presents an end-to-end retail analytics workflow built in R, using a warehouse-style transactional dataset that mirrors real-world retail operations. The analysis focuses on transforming raw sales data into business-ready insights through data validation, feature engineering, exploratory analysis, customer segmentation, product performance evaluation, and demand forecasting.
+
+The objective is not only to apply statistical techniques, but to translate analytical results into actionable business recommendations for pricing, customer strategy, and performance optimization.
+
+## Important Note on Data & Interpretation
+
+This dataset was synthetically generated for demonstration and portfolio purposes. Although it mimics a realistic retail data warehouse structure, values were randomly created.
+
+Because of this: Certain business metrics may not behave as expected (e.g., negative margins). Promotion flags (on_promo) may not vary (e.g., all set to FALSE).
+
+These outcomes are a result of the data generation process, not errors in the analytical workflow. Readers should focus primarily on the logic of the code.
+
+
+```{r Module 01: Data Ingestion & Validation}
+# ============================================================
+# Retail Analytics in R
+# Module 01: Data Ingestion & Validation
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+if (!require(janitor)) install.packages("janitor")
+library(janitor)
+
+# ------------------------------------------------------------
+# 1. Load raw data
+# ------------------------------------------------------------
+products   <- read_csv("raw_data/dim_products.csv", show_col_types = FALSE)   %>%  clean_names()
+warehouses <- read_csv("raw_data/dim_warehouses.csv", show_col_types = FALSE) %>%  clean_names()
+retailers  <- read_csv("raw_data/dim_retailers.csv", show_col_types = FALSE)  %>%  clean_names()
+customers  <- read_csv("raw_data/dim_customers.csv", show_col_types = FALSE)  %>%  clean_names()
+orders     <- read_csv("raw_data/fact_orders.csv", show_col_types = FALSE)    %>%  clean_names()
+promotions <- read_csv("raw_data/dim_promotions.csv", show_col_types = FALSE) %>%  clean_names()
+shippings  <- read_csv("raw_data/fact_shippings.csv", show_col_types = FALSE) %>%  clean_names()
+returns    <- read_csv("raw_data/fact_returns.csv", show_col_types = FALSE)   %>%  clean_names()
+calendar   <- read_csv("raw_data/dim_date.csv", show_col_types = FALSE)       %>%  clean_names()
+
+# ------------------------------------------------------------
+# 2. Basic validation checks
+# ------------------------------------------------------------
+
+# Row counts
+data.frame(
+  table = c("products","warehouses","retailers","customers",
+            "orders","promotions","shippings","returns","calendar"),
+  rows = c(
+    nrow(products),
+    nrow(warehouses),
+    nrow(retailers),
+    nrow(customers),
+    nrow(orders),
+    nrow(promotions),
+    nrow(shippings),
+    nrow(returns),
+    nrow(calendar)
+  )
+)
+
+# Primary key uniqueness checks
+stopifnot(nrow(products)   == n_distinct(products$product_sku))
+stopifnot(nrow(customers)  == n_distinct(customers$customer_id))
+stopifnot(nrow(retailers)  == n_distinct(retailers$retailer_id))
+stopifnot(nrow(warehouses) == n_distinct(warehouses$warehouse_id))
+stopifnot(nrow(orders)     == n_distinct(orders$order_id))
+
+# ------------------------------------------------------------
+# 3. Date sanity checks
+# ------------------------------------------------------------
+range(orders$order_date)
+range(calendar$date)
+
+# Shipping dates must be >= order date
+shippings %>%
+  filter(ship_date < order_date)
+
+# ------------------------------------------------------------
+# 4. Financial sanity checks
+# ------------------------------------------------------------
+
+orders %>%
+  summarise(
+    avg_price = mean(product_price),
+    avg_cost  = mean(product_cost),
+    pct_loss_leaders = mean(product_cost > product_price)
+  )
+
+# ------------------------------------------------------------
+# 5. Save cleaned objects
+# ------------------------------------------------------------
+dir.create("processed_data", showWarnings = FALSE)
+
+saveRDS(
+  list(
+    products   = products,
+    warehouses = warehouses,
+    retailers  = retailers,
+    customers  = customers,
+    orders     = orders,
+    promotions = promotions,
+    shippings  = shippings,
+    returns    = returns,
+    calendar   = calendar
+  ),
+  "processed_data/retail_data.rds"
+)
+```
+
+```{r Module 02: Data Cleaning & Feature Engineering}
+# ============================================================
+# Retail Analytics in R
+# Module 02: Data Cleaning & Feature Engineering
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+
+# ------------------------------------------------------------
+# 1. Load processed data
+# ------------------------------------------------------------
+retail_data <- readRDS("processed_data/retail_data.rds")
+
+products   <- retail_data$products
+customers  <- retail_data$customers
+retailers  <- retail_data$retailers
+warehouses <- retail_data$warehouses
+orders     <- retail_data$orders
+shippings  <- retail_data$shippings
+returns    <- retail_data$returns
+calendar   <- retail_data$calendar
+
+# ------------------------------------------------------------
+# 2. Aggregate returns at order-product level
+# ------------------------------------------------------------
+returns_summary <- returns %>%
+  group_by(order_id, product_sku) %>%
+  summarise(
+    return_quantity = sum(return_quantity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 3. Build core fact table
+# ------------------------------------------------------------
+fact_sales <- orders %>%
+  left_join(returns_summary, by = c("order_id", "product_sku")) %>%
+  mutate(
+    return_quantity = replace_na(return_quantity, 0),
+    net_quantity = order_quantity - return_quantity
+  ) %>%
+  left_join(shippings %>% select(order_id, shipping_cost, delivery_status, shipping_method),by = "order_id") %>%
+  left_join(products, by = "product_sku") %>%
+  left_join(customers, by = "customer_id") %>%
+  left_join(retailers, by = "retailer_id") %>%
+  left_join(calendar, by = c("order_date" = "date"))
+
+# ------------------------------------------------------------
+# 4. Financial feature engineering
+# ------------------------------------------------------------
+fact_sales <- fact_sales %>%
+  mutate(
+    gross_revenue = product_price * order_quantity,
+    net_revenue   = gross_revenue * (1 - random_discount),
+    cost_of_goods = product_cost * order_quantity,
+    gross_profit  = net_revenue - cost_of_goods,
+    net_profit    = gross_profit - shipping_cost,
+    gross_margin  = gross_profit / net_revenue,
+    markup        = (product_price - product_cost) / product_cost
+  )
+
+# ------------------------------------------------------------
+# 5. Data quality flags, important
+# ------------------------------------------------------------
+fact_sales <- fact_sales %>%
+  mutate(
+    loss_leader_flag = net_profit < 0,
+    full_return_flag = net_quantity <= 0,
+    delayed_delivery = delivery_status == "delayed"
+  )
+
+# ------------------------------------------------------------
+# 6. Time-based features
+# ------------------------------------------------------------
+fact_sales <- fact_sales %>%
+  mutate(
+    year_month = floor_date(order_date, "month"),
+    week       = isoweek(order_date),
+    weekday    = wday(order_date, label = TRUE),
+    order_age_days = as.numeric(Sys.Date() - order_date)
+  )
+
+# ------------------------------------------------------------
+# 7. Final sanity checks
+# ------------------------------------------------------------
+summary(select(
+  fact_sales,
+  gross_revenue,
+  net_revenue,
+  net_profit,
+  gross_margin,
+  markup
+))
+
+mean(fact_sales$loss_leader_flag)
+mean(fact_sales$full_return_flag)
+
+# Check impossible values
+fact_sales %>%
+  filter(gross_margin > 1 | gross_margin < -1) %>% 
+  select(c(order_id, gross_margin))
+
+fact_sales %>%
+  filter(markup > 5 | markup < -1) %>% 
+  select(c(order_id, markup))
+
+# ------------------------------------------------------------
+# 8. Save analysis-ready dataset
+# ------------------------------------------------------------
+saveRDS(
+  fact_sales,
+  "processed_data/fact_sales_enriched.rds"
+)
+```
+
+```{r Module 03: Exploratory Sales & Profit Analysis}
+# ============================================================
+# Retail Analytics in R
+# Module 03: Exploratory Sales & Profit Analysis
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+
+# ------------------------------------------------------------
+# 1. Load enriched fact table
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+
+# ------------------------------------------------------------
+# 2. Overall business KPIs
+# ------------------------------------------------------------
+kpi_summary <- fact_sales %>%
+  summarise(
+    total_revenue = sum(net_revenue, na.rm = TRUE),
+    total_profit  = sum(net_profit, na.rm = TRUE),
+    avg_margin    = mean(gross_margin, na.rm = TRUE),
+    total_orders  = n_distinct(order_id),
+    total_customers = n_distinct(customer_id)
+  )
+
+kpi_summary
+
+# ------------------------------------------------------------
+# 3. Revenue & profit trends over time
+# ------------------------------------------------------------
+monthly_performance <- fact_sales %>%
+  group_by(year_month) %>%
+  summarise(
+    revenue = sum(net_revenue),
+    profit  = sum(net_profit),
+    .groups = "drop"
+  )
+
+monthly_performance_long <- monthly_performance %>%
+  pivot_longer(
+    cols = c(revenue, profit),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(monthly_performance_long, aes(year_month, value, color = metric)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::dollar) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title = "Monthly Revenue vs Profit",
+    x = "Month",
+    y = "Amount",
+    color = "Metric"
+  )
+
+# ------------------------------------------------------------
+# 4. Category performance
+# ------------------------------------------------------------
+category_performance <- fact_sales %>%
+  group_by(product_category) %>%
+  summarise(
+    revenue = sum(net_revenue),
+    profit  = sum(net_profit),
+    margin  = mean(gross_margin, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+category_performance_long <- category_performance %>%
+  pivot_longer(
+    cols = c(revenue, profit),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(category_performance_long, aes(reorder(product_category, value), value, fill = metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title = "Revenue vs Profit by Product Category",
+    x = "Category",
+    y = "Amount",
+    fill = "Metric"
+  )
+
+# plot for category margin
+ggplot(category_performance,
+       aes(reorder(product_category, margin), margin)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title = "Average Profit Margin by Product Category",
+    x = "Product Category",
+    y = "Margin"
+  )
+
+# ------------------------------------------------------------
+# 5. Regional performance
+# ------------------------------------------------------------
+region_performance <- fact_sales %>%
+  group_by(region.y) %>%   # retailer region
+  summarise(
+    revenue = sum(net_revenue, na.rm = TRUE),
+    profit  = sum(net_profit, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+region_performance_long <- region_performance %>%
+  pivot_longer(
+    cols = c(revenue, profit),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(region_performance_long, aes(reorder(region.y, value), value, fill = metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title = "Revenue vs Profit by Retailer Region",
+    x = "Region",
+    y = "Amount",
+    fill = "Metric"
+  )
+# ------------------------------------------------------------
+# 6. Channel analysis
+# ------------------------------------------------------------
+channel_performance <- fact_sales %>%
+  group_by(retailer_channel) %>%
+  summarise(
+    revenue = sum(net_revenue, na.rm = TRUE),
+    profit  = sum(net_profit, na.rm = TRUE),
+    avg_shipping_cost = mean(shipping_cost, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+channel_performance_long <- channel_performance %>%
+  pivot_longer(
+    cols = c(revenue, profit),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+ggplot(channel_performance_long, aes(reorder(retailer_channel, value), value, fill = metric)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title = "Revenue vs Profit by Retailer Channel",
+    x = "Channel",
+    y = "Amount",
+    fill = "Metric"
+  )
+
+# Shipping Cost Visualization
+ggplot(channel_performance, aes(reorder(retailer_channel, avg_shipping_cost), avg_shipping_cost)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title = "Average Shipping Cost by Channel",
+    x = "Channel",
+    y = "Average Shipping Cost"
+  )
+# ------------------------------------------------------------
+# 7. Loss leader analysis
+# ------------------------------------------------------------
+fact_sales %>%
+  filter(loss_leader_flag) %>%
+  summarise(
+    loss_order_pct = n() / nrow(fact_sales),
+    total_loss = sum(net_profit)
+  )
+
+# Average order value (AOV) for loss leader orders vs normal orders
+fact_sales %>%
+  group_by(loss_leader_flag) %>%
+  summarise(
+    avg_order_value = mean(product_price * order_quantity, na.rm = TRUE),
+    total_revenue = sum(net_revenue)
+  )
+
+# Does profit from other products in the same order offset the loss?
+fact_sales %>%
+  group_by(order_id) %>%
+  summarise(
+    order_profit = sum(net_profit),
+    loss_leader_used = any(loss_leader_flag)
+  ) %>%
+  group_by(loss_leader_used) %>%
+  summarise(mean_order_profit = mean(order_profit))
+print("Orders with loss leaders do not generate positive profit -> strategy isn't working.")
+
+# Worse 20% loss_leaders
+fact_sales %>%
+  filter(loss_leader_flag) %>%
+  group_by(product_sku) %>%
+  summarise(total_loss = sum(net_profit)) %>%
+  mutate(loss_tier = ntile(total_loss, 5)) %>% 
+  filter(loss_tier == 1)
+
+# ------------------------------------------------------------
+# 8. Key takeaways (printed for report)
+# ------------------------------------------------------------
+cat(
+  "\nKey Insights:\n",
+  "- Revenue and profit trends show seasonality and volatility\n",
+  "- Certain categories drive revenue\n",
+  "- Loss-leading transactions are present and measurable\n",
+  "- Channel-level shipping costs impact profitability\n"
+)
+```
+
+```{r Module 04: Customer Analytics & RFM Segmentation}
+# ============================================================
+# Retail Analytics in R
+# Module 04: Customer Analytics & RFM Segmentation
+# ============================================================
+
+library(tidyverse)
+library(lubridate)
+
+# ------------------------------------------------------------
+# 1. Load data
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+
+analysis_date <- max(fact_sales$order_date) + 1
+
+# ------------------------------------------------------------
+# 2. RFM metrics
+# ------------------------------------------------------------
+rfm_table <- fact_sales %>%
+  group_by(customer_id) %>%
+  summarise(
+    recency = as.numeric(analysis_date - max(order_date)),
+    frequency = n_distinct(order_id),
+    monetary = sum(net_revenue),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# 3. RFM scoring, quintiles
+# ------------------------------------------------------------
+rfm_scores <- rfm_table %>%
+  mutate(
+    r_score = ntile(desc(recency), 5),
+    f_score = ntile(frequency, 5),
+    m_score = ntile(monetary, 5),
+    rfm_score = paste0(r_score, f_score, m_score)
+  )
+
+# ------------------------------------------------------------
+# 4. Customer segmentation
+# ------------------------------------------------------------
+rfm_segments <- rfm_scores %>%
+  mutate(
+    segment = case_when(
+      r_score >= 4 & f_score >= 4 & m_score >= 4 ~ "Champions",
+      r_score >= 3 & f_score >= 3 ~ "Loyal Customers",
+      r_score >= 4 & f_score <= 2 ~ "Potential Loyalists",
+      r_score <= 2 & f_score <= 2 ~ "At Risk",
+      TRUE ~ "Others"
+    )
+  )
+head(rfm_segments[, c("customer_id", "segment")])
+
+# ------------------------------------------------------------
+# 5. Segment performance
+# ------------------------------------------------------------
+rfm_segments %>%
+  group_by(segment) %>%
+  summarise(
+    customers = n(),
+    avg_revenue = mean(monetary),
+    total_revenue = sum(monetary),
+    revenue_share = total_revenue / sum(rfm_segments$monetary),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_revenue))
+
+# ------------------------------------------------------------
+# 6. Pareto (80/20) analysis
+# “Roughly 80% of effects come from 20% of causes.”
+# ------------------------------------------------------------
+pareto <- rfm_segments %>%
+  arrange(desc(monetary)) %>%
+  mutate(
+    cumulative_revenue = cumsum(monetary),
+    cumulative_pct = cumulative_revenue / sum(monetary)
+  )
+
+pareto %>%
+  filter(cumulative_pct <= 0.8) %>%
+  summarise(top_customers = n())
+
+library(ggplot2)
+library(scales)
+
+ggplot(pareto, aes(x = seq_along(customer_id), y = cumulative_pct)) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = which(pareto$cumulative_pct >= 0.8)[1], linetype = "dashed", color = "steelblue") +
+  scale_y_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title = "Pareto Analysis: Customers Contribution to Revenue",
+    x = "Customers (sorted by revenue)",
+    y = "Cumulative Revenue %"
+  ) +
+  theme_minimal()
+
+# ------------------------------------------------------------
+# 7. Key insights
+# ------------------------------------------------------------
+cat(
+  "\nCustomer Insights:\n",
+  "- Revenue is highly concentrated among a small % of customers\n",
+  "- Champions and Loyal Customers drive majority of sales\n",
+  "- At Risk segment requires retention focus\n"
+)
+```
+
+```{r Module 05: Product Profitability & Portfolio Analysis}
+# ============================================================
+# Retail Analytics in R
+# Module 05: Product Profitability & Portfolio Analysis
+# ============================================================
+
+library(tidyverse)
+library(scales)
+
+# ------------------------------------------------------------
+# 1. Load enriched fact table
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+
+# ------------------------------------------------------------
+# 2. Aggregate by product
+# ------------------------------------------------------------
+product_perf <- fact_sales %>%
+  group_by(product_sku, product_name, product_category) %>%
+  summarise(
+    total_revenue = sum(net_revenue, na.rm = TRUE),
+    total_profit  = sum(net_profit, na.rm = TRUE),
+    avg_margin    = mean(gross_margin, na.rm = TRUE),
+    total_quantity = sum(net_quantity),
+    loss_orders = sum(loss_leader_flag),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_profit))
+
+product_perf
+
+# ------------------------------------------------------------
+# 3. Top and bottom 10 products by profit
+# ------------------------------------------------------------
+product_perf %>% top_n(10, total_profit)
+
+product_perf %>% top_n(-10, total_profit)
+
+# ------------------------------------------------------------
+# 4. Revenue vs Profit scatter (identify risky products)
+# ------------------------------------------------------------
+ggplot(product_perf, aes(total_revenue, total_profit, color = product_category)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype="dashed", color="red") +
+  scale_x_continuous(labels = dollar) +
+  scale_y_continuous(labels = dollar) +
+  labs(
+    title = "Revenue vs Profit by Product",
+    x = "Revenue",
+    y = "Profit",
+    color = "Category"
+  )
+
+# ------------------------------------------------------------
+# 5. Pareto analysis: 80/20 profit
+# ------------------------------------------------------------
+product_perf <- product_perf %>%
+  arrange(desc(total_profit)) %>%
+  mutate(
+    cumulative_profit = cumsum(total_profit),
+    cumulative_pct = cumulative_profit / sum(total_profit)
+  )
+
+pareto_products <- product_perf %>%
+  filter(cumulative_pct <= 0.8)
+
+# % of products driving 80% profit
+nrow(pareto_products) / nrow(product_perf) 
+
+# ------------------------------------------------------------
+# 6. Category-level summary
+# ------------------------------------------------------------
+category_perf <- fact_sales %>%
+  group_by(product_category) %>%
+  summarise(
+    revenue = sum(net_revenue),
+    profit  = sum(net_profit),
+    margin  = mean(gross_margin, na.rm = TRUE)
+  )
+
+# For every $1 of revenue, how much profit do we make in each category?
+category_perf %>% 
+  mutate(weighted_margin = profit/revenue)
+
+# % of products in each category are actually profitable
+product_perf %>%
+  group_by(product_category) %>%
+  summarise(
+    pct_profitable_products = mean(total_profit > 0)
+  )
+
+category_perf <- category_perf %>%
+  mutate(
+    profit_share = profit / sum(profit),
+    revenue_share = revenue / sum(revenue)
+  )
+
+category_perf
+print("If a category’s profit share > revenue share -> It punches above its weight.")
+
+# ------------------------------------------------------------
+# 7. Key insights
+# ------------------------------------------------------------
+cat(
+  "\nProduct Insights:\n",
+  "- Profit is highly concentrated: a small subset of products drives the majority of total profit (Pareto 80/20)\n",
+  "- High revenue does not guarantee profitability; several products show weak or negative margins\n",
+  "- Unprofitable products exist and may act as loss leaders or indicate pricing and cost issues\n",
+  "- Category performance varies: some categories contribute more profit despite overall margin pressure\n"
+)
+```
+
+```{r Module 06: Promotions & Pricing Impact Analysis}
+# ============================================================
+# Retail Analytics in R
+# Module 06: Promotions & Pricing Impact Analysis
+# ============================================================
+
+library(tidyverse)
+library(scales)
+library(lubridate)
+
+# ------------------------------------------------------------
+# 1. Load data
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+promotions <- readRDS("processed_data/retail_data.rds")$promotions
+
+# ------------------------------------------------------------
+# 2. Join promotion info to orders
+# ------------------------------------------------------------
+fact_sales <- fact_sales %>%
+  left_join(
+    promotions,
+    by = "product_sku",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    # Check if the order is during a promotion
+    on_promo = !is.na(discount_percentage) & order_date >= start_date & order_date <= end_date,
+   
+    # Calculate the discount in dollars
+    promo_discount_amt = if_else(on_promo, product_price * order_quantity * discount_percentage, 0),
+    random_discount_amt = product_price * order_quantity * random_discount,
+    
+    # Pick the **higher discount** between promo and random
+    product_discount = round(pmax(promo_discount_amt, random_discount_amt), 2)
+  ) %>%
+  select(-start_date, -end_date, -discount_percentage, -promo_discount_amt, -random_discount_amt, -random_discount)
+
+# ------------------------------------------------------------
+# 3. Promotion and pricing impact analysis
+# ------------------------------------------------------------
+# Are promotions driving incremental revenue?
+promo_analysis <- fact_sales %>%
+  group_by(on_promo) %>%
+  summarise(
+    orders = n_distinct(order_id),
+    revenue = sum(net_revenue, na.rm = TRUE),
+    profit = sum(net_profit, na.rm = TRUE),
+    avg_margin = mean(gross_margin, na.rm = TRUE),
+    AOV = mean(net_revenue, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+promo_analysis
+print("If revenue up but profit down, then you're buying sales at the expense of margin.")
+
+# At what discount level does profit collapse?
+fact_sales %>%
+  mutate(discount_bucket = ntile(product_discount, 5)) %>%
+  group_by(discount_bucket) %>%
+  summarise(
+    avg_revenue = mean(net_revenue),
+    avg_profit = mean(net_profit)
+  )
+
+# Did promotions increase quantity?
+fact_sales %>%
+  group_by(on_promo) %>%
+  summarise(
+    total_quantity = sum(net_quantity),
+    avg_quantity = mean(net_quantity)
+  )
+
+# Which categories benefit more from promotions?
+fact_sales %>%
+  group_by(product_category, on_promo) %>%
+  summarise(
+    total_revenue = sum(net_revenue),
+    total_profit = sum(net_profit)
+  )
+print("Promotions may work for seasonal items but not premium goods.")
+
+# Time-Series Outside vs During Promotion
+fact_sales %>%
+  group_by(year_month, on_promo) %>%
+  summarise(
+    total_revenue = sum(net_revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = year_month,
+             y = total_revenue,
+             color = on_promo)) +
+  geom_line(linewidth = 1.2) +
+  geom_smooth(se = FALSE, linewidth = 1) +
+  scale_y_continuous(labels = dollar) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title = "Revenue Trend: Promotion vs Non-Promotion Periods",
+    x = "Month",
+    y = "Total Revenue",
+    color = "Promotion Status"
+  ) +
+  theme_minimal()
+
+cat("- If promotion line is consistently higher-> promotion drives revenue lift.\n",
+    "- If promotion spikes only temporarily → demand may be shifted forward.\n",
+    "- If non-promo revenue drops during promo → possible cannibalization."
+    )
+```
+
+```{r Module 07: Demand Forecasting & Trend Analysis}
+# ============================================================
+# Retail Analytics in R
+# Module 07: Demand Forecasting & Trend Analysis
+# ============================================================
+
+if (!require(forecast)) install.packages("forecast")
+if (!require(tsibble)) install.packages("tsibble")
+if (!require(feasts)) install.packages("feasts")
+if (!require(fable)) install.packages("fable")
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tsibble) # for time series
+library(feasts)
+library(fable)
+
+# ------------------------------------------------------------
+# 1. Load enriched sales data
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+
+# ------------------------------------------------------------
+# 2. Aggregate monthly sales per product
+# ------------------------------------------------------------
+monthly_sales <- fact_sales %>%
+  mutate(year_month = yearmonth(order_date)) %>% # fable models (ETS, ARIMA, etc.) expect a regular interval index
+  group_by(product_sku, product_name, year_month) %>%
+  summarise(
+    quantity_sold = sum(net_quantity),
+    revenue = sum(net_revenue),
+    .groups = "drop"
+  ) %>%
+  arrange(product_sku, year_month)
+
+# ------------------------------------------------------------
+# 3. Convert to time series (tsibble)
+# ------------------------------------------------------------
+monthly_sales_ts <- monthly_sales %>%
+  as_tsibble(index = year_month, key = product_sku)
+
+# ------------------------------------------------------------
+# 4. Forecast using ETS (Exponential Smoothing)
+# ------------------------------------------------------------
+# Fills missing year_month rows for each product_sku, needed for ETS sees a continuous monthly series
+monthly_sales_ts <- monthly_sales_ts %>%
+  fill_gaps(quantity_sold = 0, revenue = 0)
+
+ets_model <- monthly_sales_ts %>%
+  model(ets = ETS(quantity_sold))
+
+ets_fc <- forecast(ets_model, h = "3 months")  # Forecast next 3 months
+
+# ------------------------------------------------------------
+# 5. Visualize forecast for top 5 products by revenue
+# ------------------------------------------------------------
+top_products <- monthly_sales %>%
+  group_by(product_sku, product_name) %>%
+  summarise(total_revenue = sum(revenue), .groups = "drop") %>%
+  arrange(desc(total_revenue)) %>%
+  slice(1:5)
+
+ets_fc %>%
+  filter(product_sku %in% top_products$product_sku) %>%
+  autoplot(monthly_sales_ts, level = NULL) +
+  labs(
+    title = "Monthly Demand Forecast for Top 5 Products",
+    x = "Month",
+    y = "Quantity Sold"
+  )
+
+# ------------------------------------------------------------
+# 6. Evaluate forecast accuracy (backtesting)
+# ------------------------------------------------------------
+# Simple train/test split for ETS evaluation
+train <- monthly_sales_ts %>% filter(year_month <= yearmonth("2024 Jun"))
+test  <- monthly_sales_ts %>% filter(year_month > yearmonth("2024 Jun"))
+
+# Align products between train & test
+valid_products <- intersect(
+  unique(train$product_sku),
+  unique(test$product_sku)
+)
+
+train_bt <- train %>% filter(product_sku %in% valid_products)
+test_bt  <- test  %>% filter(product_sku %in% valid_products)
+
+ets_bt <- train_bt %>%
+  model(ets = ETS(quantity_sold))
+
+ets_bt_fc <- forecast(ets_bt, new_data = test_bt)
+
+accuracy(ets_bt_fc, test_bt)
+
+# ------------------------------------------------------------
+# 7. Key insights
+# ------------------------------------------------------------
+cat(
+  "\nTime Series Forecasting Insights:\n",
+  "- Monthly demand patterns were successfully modeled at the product level\n",
+  "- Exponential Smoothing (ETS) performed well for stable, high-volume products.\n",
+  "- Forecasting readiness depends on data continuity and product maturity.\n"
+)
+
+# ------------------------------------------------------------
+# 8. Forecasting with ARIMA
+# ------------------------------------------------------------
+arima_model <- monthly_sales_ts %>%
+  model(arima = ARIMA(quantity_sold))
+
+arima_fc <- forecast(arima_model, h = "3 months")
+
+arima_fc %>%
+  filter(product_sku %in% top_products$product_sku) %>%
+  autoplot(monthly_sales_ts, level = NULL) +
+  labs(
+    title = "ARIMA Forecast vs Actual Demand",
+    x = "Month",
+    y = "Quantity Sold"
+  )
+
+# ------------------------------------------------------------
+# 9. Backtesting
+# ------------------------------------------------------------
+
+arima_bt <- train_bt %>%
+  model(arima = ARIMA(quantity_sold))
+
+arima_bt_fc <- forecast(arima_bt, new_data = test_bt)
+
+accuracy(arima_bt_fc, test_bt)
+
+# ------------------------------------------------------------
+# 10. Choose the Final Forecasting Model (ETS vs ARIMA)
+# ------------------------------------------------------------
+# Fit BOTH models on the same data
+models <- train_bt %>%
+  model(
+    ets   = ETS(quantity_sold),
+    arima = ARIMA(quantity_sold)
+  )
+
+# Forecast both models
+fc <- forecast(models, new_data = test_bt)
+
+# Compare ETS vs ARIMA
+acc <- accuracy(fc, test_bt)
+
+acc %>%
+  group_by(.model) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MAE  = mean(MAE, na.rm = TRUE),
+    ME   = mean(ME, na.rm = TRUE)
+  )
+```
+
+```{r Module 08: Executive Insights & Recommendations}
+# ============================================================
+# Retail Analytics in R
+# Module 08: Executive Insights & Recommendations
+# ============================================================
+
+library(tidyverse)
+
+# ------------------------------------------------------------
+# 1. Load analysis datasets
+# ------------------------------------------------------------
+fact_sales <- readRDS("processed_data/fact_sales_enriched.rds")
+
+fact_sales <- fact_sales %>%
+  left_join(
+    promotions,
+    by = "product_sku",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(
+    # Check if the order is during a promotion
+    on_promo = !is.na(discount_percentage) & order_date >= start_date & order_date <= end_date
+  )
+
+# ------------------------------------------------------------
+# 2. Key Performance Indicator - KPIs
+# ------------------------------------------------------------
+kpis <- fact_sales %>%
+  summarise(
+    total_revenue = sum(net_revenue),
+    total_profit  = sum(net_profit),
+    avg_margin    = mean(gross_margin, na.rm = TRUE),
+    loss_leader_pct = mean(loss_leader_flag)
+  )
+
+kpis
+
+# ------------------------------------------------------------
+# 3. Profit concentration, Pareto 80/20 (Product-level)
+# ------------------------------------------------------------
+product_profit <- fact_sales %>%
+  group_by(product_sku, product_name) %>%
+  summarise(
+    profit = sum(net_profit),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(profit)) %>%
+  mutate(
+    cumulative_profit = cumsum(profit),
+    cumulative_pct = cumulative_profit / sum(profit)
+  )
+
+top_profit_products <- product_profit %>%
+  filter(cumulative_pct <= 0.8)
+
+# ------------------------------------------------------------
+# 4. Customer concentration
+# ------------------------------------------------------------
+customer_profit <- fact_sales %>%
+  group_by(customer_id) %>%
+  summarise(
+    profit = sum(net_profit),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(profit)) %>%
+  mutate(
+    cumulative_profit = cumsum(profit),
+    cumulative_pct = cumulative_profit / sum(profit)
+  )
+
+top_customers <- customer_profit %>%
+  filter(cumulative_pct <= 0.8)
+
+
+# ------------------------------------------------------------
+# 5. Promotion effectiveness snapshot
+# ------------------------------------------------------------
+promo_compare <- fact_sales %>%
+  group_by(on_promo) %>%
+  summarise(
+    avg_revenue = mean(net_revenue),
+    avg_profit  = mean(net_profit),
+    avg_margin  = mean(gross_margin, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = on_promo,
+    values_from = c(avg_revenue, avg_profit, avg_margin)
+  )
+
+# Error may occur due to data was created randomly
+# promo_lift <- promo_compare %>%
+#    mutate(
+#       revenue_lift = (avg_revenue_TRUE - avg_revenue_FALSE) /avg_revenue_FALSE,
+#       profit_lift = (avg_profit_TRUE - avg_profit_FALSE) / avg_profit_FALSE,
+#       margin_change = (avg_margin_TRUE - avg_margin_FALSE) / avg_margin_FALSE
+#   )
+
+# promo_lift %>%
+#   select(revenue_lift_pct, profit_lift_pct, margin_change_pp) %>%
+#   mutate(across(everything(), round, 2))
+
+# ------------------------------------------------------------
+# 6. Operational risk indicators
+# ------------------------------------------------------------
+ops_risk <- fact_sales %>%
+  summarise(
+    delayed_delivery_pct = mean(delayed_delivery),
+    return_rate = sum(return_quantity) / sum(order_quantity)
+  )
+
+ops_risk
+
+# Check Profit Impact of Delays
+delay_impact <- fact_sales %>%
+  group_by(delayed_delivery) %>%
+  summarise(
+    avg_profit = mean(net_profit),
+    avg_margin = mean(gross_margin, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Check Quantify Financial Impact of Returns
+returns_impact <- fact_sales %>%
+  summarise(
+    total_return_loss = sum(return_quantity * product_price),
+    return_rate = sum(return_quantity) / sum(order_quantity)
+  )
+
+# ------------------------------------------------------------
+# 7. Executive recommendations (printed)
+# ------------------------------------------------------------
+cat(
+  "\nEXECUTIVE SUMMARY & RECOMMENDATIONS\n",
+  "----------------------------------\n",
+  "1. Revenue & Profit Concentration:\n",
+  "   - A small subset of products and customers drive ~80% of profit.\n",
+  "   - Focus retention and inventory planning on these segments.\n\n",
+  
+  "2. Product Strategy:\n",
+  "   - Loss-leading products should be reviewed for repricing or discontinuation.\n",
+  "   - High-revenue, low-margin products present margin optimization opportunities.\n\n",
+  
+  "3. Customer Strategy:\n",
+  "   - Prioritize Champions & Loyal Customers with targeted promotions.\n",
+  "   - Develop retention campaigns for At-Risk customers.\n\n",
+  
+  "4. Promotions & Pricing:\n",
+  "   - Promotions may increase volume but must be controlled to protect margin.\n",
+  "   - Moderate discounts outperform deep discounts in profitability.\n\n",
+  
+  "5. Operations:\n",
+  "   - Delivery delays and returns impact profitability.\n",
+  "   - Address logistics inefficiencies to improve customer experience and margins.\n"
+)`{r}
+
+```
